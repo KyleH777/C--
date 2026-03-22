@@ -23,10 +23,10 @@ add_executable(glitch_art
     src/stb_impl.cpp   # defines STB_IMAGE_IMPLEMENTATION / STB_IMAGE_WRITE_IMPLEMENTATION
 )
 
-target_include_directories(glitch_art PRIVATE
-    include
-    ${stb_SOURCE_DIR}
-)
+target_include_directories(glitch_art PRIVATE include)
+# Mark stb as a system include so compiler warnings in the vendored
+# single-header library are silenced (they are not our code to fix).
+target_include_directories(glitch_art SYSTEM PRIVATE ${stb_SOURCE_DIR})
 
 target_compile_options(glitch_art PRIVATE
     $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O2 -Wall -Wextra -Wpedantic>
