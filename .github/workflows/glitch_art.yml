@@ -18,8 +18,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Cache the stb download so the git clone is skipped on repeat runs.
+      # Key includes the CMakeLists hash so the cache is busted if the
+      # declared version/URL changes.
+      - name: Cache FetchContent (stb)
+        uses: actions/cache@v4
+        with:
+          path: _deps
+          key: glitch-art-stb-${{ runner.os }}-${{ hashFiles('glitch_art/CMakeLists.txt') }}
+          restore-keys: glitch-art-stb-${{ runner.os }}-
+
       - name: Configure CMake
-        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -S glitch_art
+        run: >-
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DFETCHCONTENT_BASE_DIR=${{ github.workspace }}/_deps
+          -S glitch_art
 
       - name: Build
         run: cmake --build build --config ${{ matrix.build_type }} -j4

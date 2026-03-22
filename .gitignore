@@ -3,6 +3,9 @@ build/
 out/
 cmake-build-*/
 
+# FetchContent cache (set via FETCHCONTENT_BASE_DIR in CI and local builds)
+_deps/
+
 # Compiled objects and binaries
 *.o
 *.obj
