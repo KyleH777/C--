@@ -1,167 +1,116 @@
-# tickproc
+# glitch_art
 
-High-performance C++20 command-line tool for processing 2 GB+ CSV files of financial tick data.
+A C++20 command-line tool for applying **pixel-sort** and **chromatic aberration** glitch effects to images.
 
-**This project strictly adheres to RAII principles to ensure resource safety and exception-guaranteed cleanup.** Every system resource — memory-mapped file regions, file descriptors, OS handles, mutex locks, and thread lifetimes — is acquired in a constructor and released in a destructor, with no manual cleanup calls required. Move semantics are used throughout to transfer ownership without copying.
+## Features
 
-[![CMake Build & Test](https://github.com/KyleH777/C--/actions/workflows/cmake.yml/badge.svg)](https://github.com/KyleH777/C--/actions/workflows/cmake.yml)
+| Effect | What it does |
+|---|---|
+| **Pixel Sort** | Sorts every row of pixels by perceptual brightness (dark → bright), creating the classic "melting" glitch look |
+| **Chromatic Aberration** | Shifts the R channel left and the B channel right by a configurable number of pixels, mimicking lens colour fringing |
 
-## Architecture
+Both effects can be applied independently or chained.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                              Disk (CSV)                                │
-│                         2 GB+ tick data file                           │
-└───────────────────────────────┬─────────────────────────────────────────┘
-                                │
-                          open() / fstat()
-                                │
-┌───────────────────────────────▼─────────────────────────────────────────┐
-│                     MappedFile (RAII)                                   │
-│                                                                         │
-│  Linux/macOS: mmap(PROT_READ, MAP_PRIVATE) + madvise(MADV_SEQUENTIAL)  │
-│  Windows:     CreateFileMapping(PAGE_READONLY) + MapViewOfFile          │
-│                                                                         │
-│  ► Zero-copy: the OS maps file pages directly into virtual memory.     │
-│    No read() syscalls, no user-space buffers, no memcpy.               │
-│  ► Kernel read-ahead pre-fetches pages before we touch them.           │
-│  ► RAII: destructor calls munmap()/UnmapViewOfFile() automatically.    │
-└───────────────────────────────┬─────────────────────────────────────────┘
-                                │
-                        const char* data()
-                        (pointer into mapped region)
-                                │
-┌───────────────────────────────▼─────────────────────────────────────────┐
-│                      ChunkPartitioner                                   │
-│                                                                         │
-│  Divides the mapped region into N line-aligned spans (one per producer │
-│  thread).  Each span ends on a '\n' boundary so no CSV row is ever     │
-│  split across chunks.                                                  │
-│                                                                         │
-│  ► N = hardware_concurrency() / 2 (auto-scaled)                        │
-└──────┬────────────┬────────────┬────────────┬───────────────────────────┘
-       │            │            │            │
-   chunk[0]     chunk[1]     chunk[2]      chunk[N-1]
-       │            │            │            │
-┌──────▼──────┬─────▼──────┬─────▼──────┬─────▼──────┐
-│ Producer 0  │ Producer 1 │ Producer 2 │ Producer N │   ← std::jthread
-│             │            │            │            │
-│ CsvParser::for_each_row()                          │
-│   • memchr() for comma scanning (SIMD in libc)     │
-│   • string_view fields → zero allocation           │
-│   • fast_float::from_chars() for doubles           │
-│   • std::from_chars() for integers                 │
-│                                                     │
-│ Batches of 256 TickRows pushed to queue             │
-└──────┬──────┴─────┬──────┴─────┬──────┴─────┬──────┘
-       │            │            │            │
-       ▼            ▼            ▼            ▼
-┌─────────────────────────────────────────────────────┐
-│              ThreadSafeQueue<TickRow>                │
-│                  (bounded MPMC)                      │
-│                                                     │
-│  • std::mutex + dual std::condition_variable        │
-│  • Bounded capacity → backpressure when consumers   │
-│    lag, capping memory regardless of file size       │
-│  • RAII lock_guard/unique_lock in every operation   │
-│  • Spurious-wakeup safe (predicated wait)           │
-│  • shutdown() drains remaining items before exit    │
-└──────┬──────┬─────┬──────┬──────────────────────────┘
-       │      │     │      │
-       ▼      ▼     ▼      ▼
-┌──────────────────────────────────────────────────────┐
-│  Consumer 0  │  Consumer 1  │  ...  │  Consumer M   │  ← std::jthread
-│                                                      │
-│  DataProcessor::process(TickRow)                     │
-│    • mutex-guarded per-symbol aggregation            │
-│    • std::unique_ptr<ProcessedResult> lifecycle      │
-│    • VWAP, turnover, volume, tick count              │
-└──────────────────────┬───────────────────────────────┘
-                       │
-                  finalise()
-                       │
-                       ▼
-              ┌─────────────────┐
-              │  Console Output  │
-              │  (results table) │
-              └─────────────────┘
+## How It Works
+
+### 1. Loading image data (`stb_image.h`)
+
+```cpp
+// Force 4-channel RGBA regardless of the source format (JPEG, PNG, BMP, …)
+int width, height, original_channels;
+uint8_t* raw = stbi_load("photo.jpg", &width, &height, &original_channels, 4);
+// raw now points to width * height * 4 bytes: R G B A R G B A …
+std::vector<uint8_t> pixels(raw, raw + width * height * 4);
+stbi_image_free(raw);
 ```
 
-### RAII Resource Map
+`stb_image` is a single public-domain header that decodes JPEG, PNG, BMP, TGA, GIF, and more into a flat byte array. Requesting 4 channels normalises every format to RGBA so the rest of the code never has to branch on channel count.
 
-| Resource | RAII Owner | Acquisition | Release |
-|---|---|---|---|
-| Memory-mapped region | `MappedFile` | `mmap()` / `MapViewOfFile()` | `munmap()` / `UnmapViewOfFile()` in destructor |
-| File descriptor / HANDLE | `MappedFile` | `open()` / `CreateFile()` | `close()` / `CloseHandle()` in destructor |
-| Mutex locks | `std::lock_guard` / `std::unique_lock` | Constructor | Destructor (even on exception) |
-| Worker threads | `std::jthread` / `WorkerPool` | `start()` / emplace | `join()` in destructor |
-| Heap-allocated results | `std::unique_ptr<ProcessedResult>` | `std::make_unique()` | Destructor (automatic) |
+---
+
+### 2. Pixel Sorting (`include/pixel_sorter.h`)
+
+```cpp
+// Treat each group of 4 bytes as a whole RGBA pixel struct
+struct Pixel { uint8_t r, g, b, a; };
+
+for (int y = 0; y < height; ++y) {
+    Pixel* row = reinterpret_cast<Pixel*>(data + y * width * 4);
+    std::sort(row, row + width, [](const Pixel& p, const Pixel& q) {
+        // Perceptual luma (ITU-R BT.601)
+        float lp = 0.299f*p.r + 0.587f*p.g + 0.114f*p.b;
+        float lq = 0.299f*q.r + 0.587f*q.g + 0.114f*q.b;
+        return lp < lq;
+    });
+}
+```
+
+`reinterpret_cast<Pixel*>` lets `std::sort` move whole 4-byte pixels atomically — alpha is always carried with its RGB triplet.
+
+---
+
+### 3. Chromatic Aberration (`include/chromatic_aberration.h`)
+
+```cpp
+for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+        // R channel – sampled from x - shift (clamped to image boundary)
+        dst[d + 0] = src[idx(x - shift, y) + 0];
+        // G channel – no shift
+        dst[d + 1] = src[idx(x,          y) + 1];
+        // B channel – sampled from x + shift
+        dst[d + 2] = src[idx(x + shift, y) + 2];
+        // A channel – no shift
+        dst[d + 3] = src[idx(x,          y) + 3];
+    }
+}
+```
+
+Each destination pixel reads its R, G, and B values from three different source columns. The clamped `idx()` helper prevents out-of-bounds reads at the image edges.
+
+---
+
+### 4. Saving the result (`stb_image_write.h`)
+
+```cpp
+// stride = width * 4 (tightly packed RGBA rows)
+stbi_write_png("output.png", width, height, 4, pixels.data(), width * 4);
+```
+
+`stb_image_write` encodes the byte array back to a lossless PNG in one call.
+
+---
 
 ## Project Structure
 
 ```
-tickproc/
-├── CMakeLists.txt              # C++20, -O3, -flto, FetchContent(fast_float)
+glitch_art/
+├── CMakeLists.txt                  # C++20, FetchContent(stb)
 ├── include/
-│   ├── mapped_file.h           # RAII mmap wrapper (POSIX + Win32)
-│   ├── thread_safe_queue.h     # Bounded MPMC queue with backpressure
-│   ├── tick_row.h              # TickRowView (zero-copy) + TickRow (owning)
-│   ├── csv_parser.h            # memchr-based parser + chunk partitioner
-│   ├── pipeline.h              # Producer-Consumer orchestrator
-│   ├── worker_pool.h           # Dynamic thread pool (hardware_concurrency)
-│   └── data_processor.h        # Mutex-guarded aggregator with unique_ptr
-├── src/
-│   ├── main.cpp                # CLI entry point
-│   ├── mapped_file.cpp         # Platform-specific mmap/CreateFileMapping
-│   └── csv_parser.cpp          # Parser implementation (uses fast_float)
-├── bench/
-│   └── benchmark.cpp           # Single-threaded vs multi-threaded comparison
-├── scripts/
-│   └── generate_csv.py         # Generate dummy tick data (configurable size)
-└── tests/
-    ├── test_parser.cpp          # Line parsing, CRLF, partitioning
-    ├── test_queue.cpp           # Single-thread, MPMC, backpressure
-    └── test_data_processor.cpp  # Aggregation, thread safety, ownership
+│   ├── pixel_sorter.h              # sort_rows_by_brightness()
+│   └── chromatic_aberration.h      # chromatic_aberration()
+└── src/
+    ├── main.cpp                    # CLI: load → effect(s) → save
+    └── stb_impl.cpp                # STB_IMAGE_IMPLEMENTATION (one TU only)
 ```
 
 ## Build
 
 ```bash
-cd tickproc
+cd glitch_art
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
-## Run
+## Usage
 
 ```bash
-# Generate test data
-python3 scripts/generate_csv.py --size-gb 1.0
+# Pixel sort only
+./build/glitch_art photo.jpg out.png --sort
 
-# Process
-./build/tickproc tick_data.csv
+# Chromatic aberration only (shift = 12 px)
+./build/glitch_art photo.jpg out.png --aberration 12
 
-# Benchmark (single-threaded vs multi-threaded comparison)
-./build/tickproc_bench tick_data.csv
+# Chain both effects
+./build/glitch_art photo.jpg out.png --sort --aberration 8
 ```
-
-## Tests
-
-```bash
-ctest --test-dir build --output-on-failure
-```
-
-## CI/CD
-
-Every push and pull request triggers the [CMake Build & Test](https://github.com/KyleH777/C--/actions/workflows/cmake.yml) workflow, which builds on Ubuntu and macOS in both Debug and Release modes, runs all unit tests, and performs a smoke test with a 10 MB generated CSV.
-
-## Key Design Decisions
-
-| Decision | Rationale |
-|---|---|
-| `madvise(MADV_SEQUENTIAL)` | Triggers aggressive kernel read-ahead for sequential 2 GB+ scans |
-| `fast_float` for double parsing | 4-10x faster than `std::stod` / `strtod`, IEEE-754 compliant |
-| `string_view` fields | Point directly into the mmap region -- zero heap allocation per row |
-| Bounded queue (backpressure) | Caps memory to `capacity * sizeof(TickRow)` regardless of file size |
-| Per-thread batch push (256 rows) | Reduces mutex acquisitions by ~256x on the hot path |
-| `MAP_PRIVATE` + read-only | Pages shared with the kernel page cache, no COW overhead |
