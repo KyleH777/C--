@@ -1,12 +1,191 @@
-# glitch_art
+# C++ Showcase Projects
 
-![demo](assets/demo.gif)
+Two high-performance C++ tools demonstrating OOP, memory management, and systems programming.
+
+---
+
+# 🎮 Particle Simulation
+
+![particle demo](assets/particle_demo.gif)
+
+[![Particle Sim Build](https://github.com/KyleH777/C--/actions/workflows/particle_sim.yml/badge.svg)](https://github.com/KyleH777/C--/actions/workflows/particle_sim.yml)
+
+A real-time 2D particle fountain built with **C++20** and **SFML**, rendering up to 20 000 particles in a single GPU draw call.
+
+---
+
+## Architecture
+
+### Class Diagram
+
+```
+┌──────────────────────────────────┐       ┌──────────────────────────────────────────────────────────┐
+│            Particle              │       │                    ParticleSystem                        │
+│          (data struct)           │       │               (extends sf::Drawable)                     │
+├──────────────────────────────────┤       ├──────────────────────────────────────────────────────────┤
+│ + position    : sf::Vector2f     │       │ - m_emitter      : sf::Vector2f                          │
+│ + velocity    : sf::Vector2f     │  1..* │ - m_particles    : std::vector<Particle>  ← pre-reserved │
+│ + color       : sf::Color        │◄──────│ - m_vertices     : sf::VertexArray (Quads)               │
+│ + lifetime    : float            │       │ - m_maxParticles : const std::size_t                     │
+│ + maxLifetime : float            │       │ - m_rng          : std::mt19937                          │
+│ + size        : float            │       ├──────────────────────────────────────────────────────────┤
+├──────────────────────────────────┤       │ + ParticleSystem(maxParticles)                           │
+│ + isAlive()   : bool             │       │ + setEmitter(pos)                                        │
+│ + lifeRatio() : float  [0 → 1]   │       │ + emit(count)                                            │
+└──────────────────────────────────┘       │ + update(dt)                                             │
+                                           │ + activeCount() / maxCapacity()                          │
+                                           ├──────────────────────────────────────────────────────────┤
+                                           │ - draw(target, states)   [sf::Drawable override]         │
+                                           │ - resetParticle(p)                                       │
+                                           │ - rebuildVertices()                                      │
+                                           └──────────────────────────────────────────────────────────┘
+```
+
+**`Particle`** is a plain data struct — no vtable, no heap allocation, stored by value in a contiguous array.
+
+**`ParticleSystem`** inherits `sf::Drawable` so callers write `window.draw(particles)` — the system handles batching internally.
+
+---
+
+## `std::vector` and `reserve()` — Why It Matters
+
+```cpp
+// ── Constructor ───────────────────────────────────────────────────────────────
+ParticleSystem::ParticleSystem(std::size_t maxParticles)
+    : m_maxParticles(maxParticles)
+{
+    m_particles.reserve(maxParticles);  // ← the single most important call
+}
+```
+
+Without `reserve()`, `std::vector` starts with zero capacity and **doubles** every time `size()` reaches `capacity()`. Each doubling triggers:
+
+| Step | Cost |
+|---|---|
+| `malloc()` | Allocates a new, larger contiguous block |
+| move/copy | Relocates every existing `Particle` to the new block |
+| `free()` | Releases the old block |
+
+In a 60 Hz game loop this means random, unpredictable frame spikes — exactly when you can least afford them.
+
+`reserve(maxParticles)` eliminates all of that:
+
+```
+Without reserve()                    With reserve(20'000)
+─────────────────────                ─────────────────────────────────
+capacity: 0 → 1 → 2 → 4 → 8 …       capacity: 20'000 from frame 1
+15+ reallocations before             0 reallocations ever
+reaching 20 000 particles
+
+Hot-path per push_back:              Hot-path per push_back:
+  sometimes: malloc + N moves          always: write 1 Particle (≈ 40 B)
+  always:    write 1 Particle
+```
+
+Because the vector never reallocates, the memory layout remains a single contiguous block — the CPU's prefetcher can stream through `m_particles` at full memory bandwidth.
+
+---
+
+## Batch Rendering with `sf::VertexArray`
+
+The naive approach calls `window.draw(circle)` for each particle — N separate draw calls, N GPU state changes:
+
+```
+Naive (N = 10 000 particles):        Batch (always):
+  draw(circle[0])                      draw(m_vertices)   // one call
+  draw(circle[1])                      // submits 40 000 vertices at once
+  …
+  draw(circle[9999])
+  // 10 000 GPU state changes!
+```
+
+`ParticleSystem` maintains a `sf::VertexArray` of `sf::Quads` (4 vertices per particle). `rebuildVertices()` writes the positions and colours every frame in a cache-friendly linear pass, then `draw()` submits the whole array in a single call.
+
+---
+
+## CMakeLists.txt — Cross-Platform SFML Setup
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(particle_sim CXX)
+set(CMAKE_CXX_STANDARD 20)
+
+# Step 1 ── Pull SFML from GitHub, pinned to a specific release.
+#           No system install needed on any platform.
+include(FetchContent)
+FetchContent_Declare(
+    SFML
+    GIT_REPOSITORY https://github.com/SFML/SFML.git
+    GIT_TAG        2.6.1       # change tag here to upgrade
+    GIT_SHALLOW    TRUE        # only fetch this commit, saves bandwidth
+)
+
+# Step 2 ── Disable modules we don't use (saves ~60 s of compile time).
+set(SFML_BUILD_AUDIO   OFF CACHE BOOL "" FORCE)
+set(SFML_BUILD_NETWORK OFF CACHE BOOL "" FORCE)
+
+FetchContent_MakeAvailable(SFML)
+
+# Step 3 ── Define the target.
+add_executable(particle_sim src/main.cpp src/ParticleSystem.cpp)
+target_include_directories(particle_sim PRIVATE include)
+
+# Step 4 ── Link. SFML 2.x uses lowercase target names when built from source.
+target_link_libraries(particle_sim PRIVATE
+    sfml-graphics   # sf::RenderWindow, sf::VertexArray, sf::Color …
+    sfml-window     # sf::Event, sf::Mouse …
+    sfml-system     # sf::Vector2f, sf::Clock …
+)
+
+# Step 5 ── Copy DLLs next to the .exe on Windows (required at runtime).
+if(WIN32)
+    add_custom_command(TARGET particle_sim POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_RUNTIME_DLLS:particle_sim>
+            $<TARGET_FILE_DIR:particle_sim>
+        COMMAND_EXPAND_LISTS
+    )
+endif()
+```
+
+**Why `FetchContent` beats `find_package`** for cross-platform work:
+
+| | `find_package` | `FetchContent` |
+|---|---|---|
+| Requires system SFML | Yes | No |
+| Works on fresh CI runner | Only if pre-installed | Always |
+| Version pinned | No (uses whatever's installed) | Yes (`GIT_TAG`) |
+| Works on Windows/macOS/Linux unchanged | Often not | Yes |
+
+---
+
+## Build
+
+```bash
+cd particle_sim
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+./build/particle_sim          # Linux/macOS
+.\build\Release\particle_sim  # Windows
+```
+
+## Controls
+
+| Input | Action |
+|---|---|
+| Move mouse | Move emitter |
+| Left-click (hold) | Burst mode (3× emission rate) |
+| `ESC` | Quit |
+
+---
+
+# 🎨 Glitch Art
+
+![glitch demo](assets/demo.gif)
 
 [![Glitch Art Build](https://github.com/KyleH777/C--/actions/workflows/glitch_art.yml/badge.svg)](https://github.com/KyleH777/C--/actions/workflows/glitch_art.yml)
 
-A C++20 command-line tool for applying **pixel-sort** and **chromatic aberration** glitch effects to any image.
-
----
+A C++20 CLI tool for applying **pixel-sort** and **chromatic aberration** effects to images.
 
 ## Gallery
 
@@ -16,121 +195,14 @@ A C++20 command-line tool for applying **pixel-sort** and **chromatic aberration
 | **Chromatic Aberration** | **Both Effects** |
 | ![aberration](assets/sample_aberration.png) | ![both](assets/sample_both.png) |
 
----
-
-## Features
-
-| Effect | What it does |
-|---|---|
-| **Pixel Sort** | Sorts every row of pixels by perceptual brightness (dark → bright), creating the classic "melting" glitch look |
-| **Chromatic Aberration** | Shifts the R channel left and the B channel right by a configurable number of pixels, mimicking lens colour fringing |
-
-Both effects can be applied independently or chained.
-
----
-
-## How It Works
-
-### 1. Loading image data (`stb_image.h`)
-
-```cpp
-// Force 4-channel RGBA regardless of the source format (JPEG, PNG, BMP, …)
-int width, height, original_channels;
-uint8_t* raw = stbi_load("photo.jpg", &width, &height, &original_channels, 4);
-// raw now points to width * height * 4 bytes: R G B A R G B A …
-std::vector<uint8_t> pixels(raw, raw + width * height * 4);
-stbi_image_free(raw);
-```
-
-`stb_image` is a single public-domain header that decodes JPEG, PNG, BMP, TGA, GIF, and more into a flat byte array. Requesting 4 channels normalises every format to RGBA so the rest of the code never has to branch on channel count.
-
----
-
-### 2. Pixel Sorting (`include/pixel_sorter.h`)
-
-```cpp
-// Treat each group of 4 bytes as a whole RGBA pixel struct
-struct Pixel { uint8_t r, g, b, a; };
-
-for (int y = 0; y < height; ++y) {
-    Pixel* row = reinterpret_cast<Pixel*>(data + y * width * 4);
-    std::sort(row, row + width, [](const Pixel& p, const Pixel& q) {
-        // Perceptual luma (ITU-R BT.601)
-        float lp = 0.299f*p.r + 0.587f*p.g + 0.114f*p.b;
-        float lq = 0.299f*q.r + 0.587f*q.g + 0.114f*q.b;
-        return lp < lq;
-    });
-}
-```
-
-`reinterpret_cast<Pixel*>` lets `std::sort` move whole 4-byte RGBA units atomically — alpha is always carried with its RGB triplet.
-
----
-
-### 3. Chromatic Aberration (`include/chromatic_aberration.h`)
-
-```cpp
-for (int y = 0; y < height; ++y) {
-    for (int x = 0; x < width; ++x) {
-        // R channel – sampled from x - shift (clamped to image boundary)
-        dst[d + 0] = src[idx(x - shift, y) + 0];
-        // G channel – no shift
-        dst[d + 1] = src[idx(x,          y) + 1];
-        // B channel – sampled from x + shift
-        dst[d + 2] = src[idx(x + shift, y) + 2];
-        // A channel – no shift
-        dst[d + 3] = src[idx(x,          y) + 3];
-    }
-}
-```
-
-Each destination pixel reads its R, G, and B values from three different source columns. The clamped `idx()` helper prevents any out-of-bounds reads at the image edges.
-
----
-
-### 4. Saving the result (`stb_image_write.h`)
-
-```cpp
-// stride = width * 4 (tightly packed RGBA rows)
-stbi_write_png("output.png", width, height, 4, pixels.data(), width * 4);
-```
-
-`stb_image_write` encodes the byte array back to a lossless PNG in one call.
-
----
-
-## Project Structure
-
-```
-glitch_art/
-├── CMakeLists.txt                  # C++20, FetchContent(stb)
-├── include/
-│   ├── pixel_sorter.h              # sort_rows_by_brightness()
-│   └── chromatic_aberration.h      # chromatic_aberration()
-└── src/
-    ├── main.cpp                    # CLI: load → effect(s) → save
-    └── stb_impl.cpp                # STB_IMAGE_IMPLEMENTATION (one TU only)
-```
-
----
-
-## Build
+## Build & Usage
 
 ```bash
 cd glitch_art
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
-```
 
-## Usage
-
-```bash
-# Pixel sort only
 ./build/glitch_art photo.jpg out.png --sort
-
-# Chromatic aberration only (shift = 12 px)
 ./build/glitch_art photo.jpg out.png --aberration 12
-
-# Chain both effects
 ./build/glitch_art photo.jpg out.png --sort --aberration 8
 ```
