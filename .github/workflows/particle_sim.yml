@@ -1,0 +1,59 @@
+name: Particle Sim Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / ${{ matrix.build_type }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        build_type: [Debug, Release]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # SFML's sfml-window module requires several X11/OpenGL headers on Linux.
+      # These packages provide the headers used at compile time; no display
+      # server is needed for compilation, only for running the binary.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libgl1-mesa-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libudev-dev \
+            libfreetype-dev
+
+      # Cache the full SFML FetchContent tree (source + build artefacts).
+      # Building SFML from scratch takes ~3-4 minutes on every runner; caching
+      # cuts that to a few seconds on cache hit.
+      # Key is per-OS + build-type + CMakeLists hash so it is busted whenever
+      # the declared SFML version changes.
+      - name: Cache FetchContent (SFML)
+        uses: actions/cache@v4
+        with:
+          path: _deps
+          key: particle-sim-sfml-${{ runner.os }}-${{ matrix.build_type }}-${{ hashFiles('particle_sim/CMakeLists.txt') }}
+          restore-keys: |
+            particle-sim-sfml-${{ runner.os }}-${{ matrix.build_type }}-
+            particle-sim-sfml-${{ runner.os }}-
+
+      - name: Configure CMake
+        run: >-
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DFETCHCONTENT_BASE_DIR=${{ github.workspace }}/_deps
+          -S particle_sim
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.build_type }} -j4

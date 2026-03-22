@@ -25,9 +25,10 @@
 /// The queue is bounded so producers back-pressure when consumers lag.
 class Pipeline {
 public:
+    /// Returned to the caller after the pipeline finishes.
     struct Stats {
-        std::atomic<uint64_t> rows_parsed   {0};
-        std::atomic<uint64_t> rows_consumed {0};
+        uint64_t rows_parsed   = 0;
+        uint64_t rows_consumed = 0;
     };
 
     using ConsumerFn = std::function<void(TickRow&&)>;
@@ -37,9 +38,12 @@ public:
         unsigned    consumer_threads = 0; // 0 = auto
         std::size_t queue_capacity   = 16384;
         bool        skip_header      = true;
+        Config() = default;
     };
 
-    explicit Pipeline(Config cfg = {})
+    Pipeline() : Pipeline(Config{}) {}
+
+    explicit Pipeline(Config cfg)
         : cfg_(cfg)
         , queue_(cfg.queue_capacity)
     {
@@ -56,7 +60,8 @@ public:
     /// Run the full pipeline synchronously.  Returns when all data is
     /// parsed and consumed.
     Stats run(const MappedFile& file, ConsumerFn consumer) {
-        Stats stats;
+        std::atomic<uint64_t> rows_parsed{0};
+        std::atomic<uint64_t> rows_consumed{0};
 
         auto chunks = CsvParser::partition(file.span(), cfg_.producer_threads);
 
@@ -67,7 +72,7 @@ public:
             consumers.emplace_back([&] {
                 while (auto row = queue_.pop()) {
                     consumer(std::move(*row));
-                    stats.rows_consumed.fetch_add(1, std::memory_order_relaxed);
+                    rows_consumed.fetch_add(1, std::memory_order_relaxed);
                 }
             });
         }
@@ -96,7 +101,7 @@ public:
                         }
 
                         batch.push_back(TickRow::from_view(view));
-                        stats.rows_parsed.fetch_add(1, std::memory_order_relaxed);
+                        rows_parsed.fetch_add(1, std::memory_order_relaxed);
 
                         if (batch.size() >= kBatchSize) {
                             queue_.push_batch(batch);
@@ -123,7 +128,7 @@ public:
         for (auto& t : consumers)
             t.join();
 
-        return stats;
+        return Stats{rows_parsed.load(), rows_consumed.load()};
     }
 
 private:
