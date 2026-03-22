@@ -29,8 +29,6 @@ target_include_directories(glitch_art PRIVATE
 )
 
 target_compile_options(glitch_art PRIVATE
-    -O2
-    -Wall
-    -Wextra
-    -Wpedantic
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O2 -Wall -Wextra -Wpedantic>
+    $<$<CXX_COMPILER_ID:MSVC>:/O2 /W4>
 )
