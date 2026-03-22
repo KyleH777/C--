@@ -30,5 +30,5 @@ target_include_directories(glitch_art SYSTEM PRIVATE ${stb_SOURCE_DIR})
 
 target_compile_options(glitch_art PRIVATE
     $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O2 -Wall -Wextra -Wpedantic>
-    $<$<CXX_COMPILER_ID:MSVC>:/O2 /W4>
+    $<$<CXX_COMPILER_ID:MSVC>:/W4>
 )
