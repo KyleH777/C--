@@ -4,7 +4,7 @@ High-performance C++20 command-line tool for processing 2 GB+ CSV files of finan
 
 **This project strictly adheres to RAII principles to ensure resource safety and exception-guaranteed cleanup.** Every system resource — memory-mapped file regions, file descriptors, OS handles, mutex locks, and thread lifetimes — is acquired in a constructor and released in a destructor, with no manual cleanup calls required. Move semantics are used throughout to transfer ownership without copying.
 
-[![CMake Build & Test](../../actions/workflows/cmake.yml/badge.svg)](../../actions/workflows/cmake.yml)
+[![CMake Build & Test](https://github.com/KyleH777/C--/actions/workflows/cmake.yml/badge.svg)](https://github.com/KyleH777/C--/actions/workflows/cmake.yml)
 
 ## Architecture
 
@@ -153,7 +153,7 @@ ctest --test-dir build --output-on-failure
 
 ## CI/CD
 
-Every push and pull request triggers the [CMake Build & Test](.github/workflows/cmake.yml) workflow, which builds on Ubuntu and macOS in both Debug and Release modes, runs all unit tests, and performs a smoke test with a 10 MB generated CSV.
+Every push and pull request triggers the [CMake Build & Test](https://github.com/KyleH777/C--/actions/workflows/cmake.yml) workflow, which builds on Ubuntu and macOS in both Debug and Release modes, runs all unit tests, and performs a smoke test with a 10 MB generated CSV.
 
 ## Key Design Decisions
 

@@ -1,0 +1,38 @@
+name: CMake Build & Test
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / ${{ matrix.build_type }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        build_type: [Debug, Release]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -S tickproc
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.build_type }} -j$(nproc 2>/dev/null || sysctl -n hw.logicalcpu)
+
+      - name: Run unit tests
+        run: ctest --test-dir build --output-on-failure -C ${{ matrix.build_type }}
+
+      - name: Smoke test (generate + process 10 MB CSV)
+        run: |
+          python3 tickproc/scripts/generate_csv.py --size-gb 0.01
+          ./build/tickproc tick_data.csv
