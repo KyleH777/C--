@@ -1,6 +1,22 @@
 # glitch_art
 
-A C++20 command-line tool for applying **pixel-sort** and **chromatic aberration** glitch effects to images.
+![demo](assets/demo.gif)
+
+[![Glitch Art Build](https://github.com/KyleH777/C--/actions/workflows/glitch_art.yml/badge.svg)](https://github.com/KyleH777/C--/actions/workflows/glitch_art.yml)
+
+A C++20 command-line tool for applying **pixel-sort** and **chromatic aberration** glitch effects to any image.
+
+---
+
+## Gallery
+
+| Original | Pixel Sort |
+|:---:|:---:|
+| ![original](assets/sample_original.png) | ![sorted](assets/sample_sorted.png) |
+| **Chromatic Aberration** | **Both Effects** |
+| ![aberration](assets/sample_aberration.png) | ![both](assets/sample_both.png) |
+
+---
 
 ## Features
 
@@ -10,6 +26,8 @@ A C++20 command-line tool for applying **pixel-sort** and **chromatic aberration
 | **Chromatic Aberration** | Shifts the R channel left and the B channel right by a configurable number of pixels, mimicking lens colour fringing |
 
 Both effects can be applied independently or chained.
+
+---
 
 ## How It Works
 
@@ -45,7 +63,7 @@ for (int y = 0; y < height; ++y) {
 }
 ```
 
-`reinterpret_cast<Pixel*>` lets `std::sort` move whole 4-byte pixels atomically — alpha is always carried with its RGB triplet.
+`reinterpret_cast<Pixel*>` lets `std::sort` move whole 4-byte RGBA units atomically — alpha is always carried with its RGB triplet.
 
 ---
 
@@ -66,7 +84,7 @@ for (int y = 0; y < height; ++y) {
 }
 ```
 
-Each destination pixel reads its R, G, and B values from three different source columns. The clamped `idx()` helper prevents out-of-bounds reads at the image edges.
+Each destination pixel reads its R, G, and B values from three different source columns. The clamped `idx()` helper prevents any out-of-bounds reads at the image edges.
 
 ---
 
@@ -93,6 +111,8 @@ glitch_art/
     ├── main.cpp                    # CLI: load → effect(s) → save
     └── stb_impl.cpp                # STB_IMAGE_IMPLEMENTATION (one TU only)
 ```
+
+---
 
 ## Build
 
