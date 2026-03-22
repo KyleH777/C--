@@ -40,14 +40,6 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(fast_float)
 
-# ── cpp-httplib (header-only HTTP server) ────────────────────────────────
-FetchContent_Declare(
-    httplib
-    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
-    GIT_TAG        v0.18.3
-)
-FetchContent_MakeAvailable(httplib)
-
 # ── Library target (core logic, reusable in tests) ──────────────────────────
 add_library(tickproc_core STATIC
     src/mapped_file.cpp
@@ -64,14 +56,6 @@ endif()
 # ── CLI executable ──────────────────────────────────────────────────────────
 add_executable(tickproc src/main.cpp)
 target_link_libraries(tickproc PRIVATE tickproc_core)
-
-# ── REST API server ─────────────────────────────────────────────────────────
-add_executable(tickproc_server src/server.cpp)
-target_link_libraries(tickproc_server PRIVATE tickproc_core httplib::httplib)
-
-# ── Benchmark executable ────────────────────────────────────────────────────
-add_executable(tickproc_bench bench/benchmark.cpp)
-target_link_libraries(tickproc_bench PRIVATE tickproc_core)
 
 # ── Tests ───────────────────────────────────────────────────────────────────
 option(TICKPROC_BUILD_TESTS "Build unit tests" ON)
