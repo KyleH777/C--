@@ -74,8 +74,8 @@ int main(int argc, char* argv[]) {
         double elapsed = std::chrono::duration<double>(t1 - t0).count();
 
         // ── Report ─────────────────────────────────────────────────────
-        std::cerr << "Parsed:   " << stats.rows_parsed.load()   << " rows\n"
-                  << "Consumed: " << stats.rows_consumed.load() << " rows\n"
+        std::cerr << "Parsed:   " << stats.rows_parsed   << " rows\n"
+                  << "Consumed: " << stats.rows_consumed << " rows\n"
                   << "Elapsed:  " << elapsed << " s\n"
                   << "Throughput: "
                   << (file.size() / (1024.0 * 1024.0)) / elapsed

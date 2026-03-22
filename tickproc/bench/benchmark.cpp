@@ -96,10 +96,10 @@ static BenchResult bench_pipeline(const MappedFile& file, double file_mib,
         std::to_string(producers) + "P/" + std::to_string(consumers)
             + "C Pipeline",
         total_threads,
-        stats.rows_consumed.load(),
+        stats.rows_consumed,
         elapsed,
         file_mib / elapsed,
-        static_cast<double>(stats.rows_consumed.load()) / 1e6 / elapsed
+        static_cast<double>(stats.rows_consumed) / 1e6 / elapsed
     };
 }
 

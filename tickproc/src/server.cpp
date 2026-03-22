@@ -87,8 +87,8 @@ int main(int argc, char* argv[]) {
     });
 
     state.results      = processor.finalise();
-    state.rows_parsed   = stats.rows_parsed.load();
-    state.rows_consumed = stats.rows_consumed.load();
+    state.rows_parsed   = stats.rows_parsed;
+    state.rows_consumed = stats.rows_consumed;
 
     auto t1 = std::chrono::high_resolution_clock::now();
     state.load_time_s = std::chrono::duration<double>(t1 - t0).count();
