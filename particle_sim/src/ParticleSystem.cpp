@@ -1,173 +1,201 @@
+// ── Parallel STL ──────────────────────────────────────────────────────────────
+// std::execution::par_unseq requires:
+//   • GCC/Clang on Linux: link against Intel TBB  (set by CMakeLists.txt)
+//   • MSVC on Windows:    ships with the CRT, no extra library needed
+//   • AppleClang:         not supported — falls back to sequential
+//
+// CMakeLists.txt defines PARTICLE_PARALLEL when TBB is available or MSVC is
+// used, so this file never calls <execution> on a toolchain that lacks it.
+#ifdef PARTICLE_PARALLEL
+#  include <execution>
+#  define PAR_POLICY std::execution::par_unseq,
+#else
+#  define PAR_POLICY   // empty — sequential std::for_each
+#endif
+
 #include "ParticleSystem.h"
 
 #include <algorithm>
 #include <cmath>
+#include <numeric>   // std::iota
 
 namespace {
-    // ── Physics constants ─────────────────────────────────────────────────────
-    constexpr float kGravity           = 200.f;   // px/s² downward
-    constexpr float kUpwardBias        = 320.f;   // subtracted from spawn vy
-    constexpr float kRestitution       = 0.65f;   // velocity retained on bounce [0,1]
-    constexpr float kAttractionStrength = 500.f;  // max px/s² toward attractor
-    constexpr float kAttractionMinDist =  20.f;   // prevents singularity at origin
+    constexpr float kGravity            = 200.f;
+    constexpr float kUpwardBias         = 320.f;
+    constexpr float kRestitution        = 0.65f;
+    constexpr float kAttractionStrength = 500.f;
+    constexpr float kAttractionMinDist  =  20.f;
 }
 
 // ── Construction ──────────────────────────────────────────────────────────────
 ParticleSystem::ParticleSystem(std::size_t maxParticles,
                                float boundsW, float boundsH)
-    : m_vertices(sf::Quads)
-    , m_maxParticles(maxParticles)
+    : m_maxParticles(maxParticles)
     , m_boundsW(boundsW)
     , m_boundsH(boundsH)
 {
-    // Pre-allocate the entire storage block upfront (see previous session for
-    // the full reserve() explanation). Zero heap allocations on the hot-path.
+    // ── Layer 1: Pre-allocate both buffers ────────────────────────────────────
+    //
+    // Particles — same reserve() rationale as before: zero reallocs on
+    // the hot-path; contiguous memory for cache-friendly linear scans.
     m_particles.reserve(maxParticles);
+
+    // Vertices — THIS is the key fix for the "sf::VertexArray" question.
+    //
+    // The old code called m_vertices.resize(m_particles.size() * 4) EVERY
+    // frame inside rebuildVertices(). Even though sf::VertexArray only grows,
+    // the resize() call itself walks the size/capacity check each frame.
+    //
+    // By switching from sf::VertexArray to std::vector<sf::Vertex> and
+    // calling resize() ONCE here, rebuildVertices() becomes a pure write
+    // loop — no length checks, no branching, no allocation ever again.
+    //
+    // We size it to the full maximum immediately: dead particle slots write
+    // transparent quads, which the GPU discards with near-zero cost.
+    m_vertices.resize(maxParticles * 4);
 }
 
 // ── Public interface ──────────────────────────────────────────────────────────
-
-void ParticleSystem::setEmitter(sf::Vector2f pos) noexcept {
-    m_emitter = pos;
-}
-
-void ParticleSystem::setBoundaryMode(BoundaryMode mode) noexcept {
-    m_boundaryMode = mode;
-}
-
+void ParticleSystem::setEmitter(sf::Vector2f pos)              noexcept { m_emitter = pos; }
+void ParticleSystem::setBoundaryMode(BoundaryMode mode)        noexcept { m_boundaryMode = mode; }
 void ParticleSystem::setAttractor(sf::Vector2f pos, bool active) noexcept {
     m_attractorPos    = pos;
     m_attractorActive = active;
 }
+BoundaryMode ParticleSystem::boundaryMode() const noexcept { return m_boundaryMode; }
 
-BoundaryMode ParticleSystem::boundaryMode() const noexcept {
-    return m_boundaryMode;
+// O(1): atomic load, not a loop.
+std::size_t ParticleSystem::activeCount() const noexcept {
+    return m_activeCount.load(std::memory_order_relaxed);
 }
+std::size_t ParticleSystem::maxCapacity() const noexcept { return m_maxParticles; }
 
 void ParticleSystem::emit(std::size_t count) {
+    // emit() is called from the main thread — serial, safe to use m_rng.
     for (std::size_t i = 0; i < count; ++i) {
         if (m_particles.size() < m_maxParticles) {
             m_particles.emplace_back();
-            resetParticle(m_particles.back());
+            resetParticle(m_particles.back());    // increments m_activeCount
         } else {
             for (auto& p : m_particles) {
-                if (!p.isAlive()) { resetParticle(p); break; }
+                if (!p.isAlive()) { resetParticle(p); break; }  // increments m_activeCount
             }
         }
     }
 }
 
-// ── Physics pipeline ──────────────────────────────────────────────────────────
+// ── Physics pipeline (parallel) ───────────────────────────────────────────────
 //
-// Each frame, for every alive particle:
+// std::for_each with par_unseq splits work across all CPU cores. The
+// correctness requirement for par_unseq is:
 //
-//   Step 1 — Gravity
-//     Gravity is a constant downward acceleration. We add it to the
-//     particle's acceleration accumulator. Because Particle::update() resets
-//     acceleration to zero after integration, we must re-add it every frame.
+//   Each loop iteration must be independent — no shared mutable state
+//   that two iterations could race to read AND write simultaneously.
 //
-//   Step 2 — Mouse Attraction Force (when active)
-//     Given the mouse position M and particle position P:
-//
-//       delta = M - P                 ← vector from particle TO mouse
-//       dist  = ||delta||             ← Euclidean length
-//       dir   = delta / dist          ← unit vector (normalised direction)
-//
-//     Normalisation:
-//       A raw delta vector has both direction AND magnitude. Dividing by its
-//       length extracts only the direction (unit length = 1). This lets us
-//       apply a force of exactly kAttractionStrength toward the mouse,
-//       independent of how far away it is.
-//
-//     We clamp the distance at kAttractionMinDist to avoid a singularity:
-//     if a particle sits exactly on the mouse, dist = 0 → division by zero.
-//     The clamp keeps the force finite and prevents velocity explosions.
-//
-//     Falloff:  force = dir * (kAttractionStrength / max(dist, minDist))
-//       • At large distances the force is weak (particles drift inward).
-//       • Close to the cursor the force is strong (particles swirl).
-//       • 1/r falloff (not 1/r²) is visually satisfying without being too
-//         chaotic at close range.
-//
-//   Step 3 — Particle::update(dt)   [semi-implicit Euler]
-//     velocity += acceleration * dt
-//     position += velocity     * dt   (uses new velocity — symplectic form)
-//     acceleration = {}               (reset for next frame)
-//     lifetime -= dt
-//
-//   Step 4 — Boundary handling
-//     Delegates to applyBoundary() based on m_boundaryMode.
-//
-//   Step 5 — Visual decay
-//     Colour and size are driven by lifeRatio() so they stay in sync.
+// Our loop satisfies this because:
+//   • Each particle writes only to its own Particle object.
+//   • m_attractorActive, m_attractorPos, m_boundsW/H are read-only in the loop.
+//   • m_rng is NOT used in the parallel body (only in resetParticle/emit, serial).
+//   • m_activeCount uses fetch_sub(relaxed): atomic, no data race.
 //
 void ParticleSystem::update(float dt) {
-    const sf::Vector2f gravityAccel{ 0.f, kGravity };
+    // Capture loop-invariant values before entering the parallel section.
+    // Capturing `this` would work too, but local copies avoid a pointer
+    // dereference on every particle when running across multiple cores.
+    const sf::Vector2f gravityAccel  { 0.f, kGravity };
+    const bool         attracting     = m_attractorActive;
+    const sf::Vector2f attractorPos   = m_attractorPos;
+    const BoundaryMode boundaryMode   = m_boundaryMode;
+    const float        boundsW        = m_boundsW;
+    const float        boundsH        = m_boundsH;
 
-    for (auto& p : m_particles) {
-        if (!p.isAlive()) continue;
+    // ── Layer 2: Parallel physics ─────────────────────────────────────────────
+    //
+    // std::for_each is chosen over a raw for-loop because it accepts an
+    // execution policy as its first argument — a single-token change toggles
+    // between sequential and parallel without restructuring the loop body.
+    //
+    //   Sequential:  std::for_each(          begin, end, fn);
+    //   Parallel:    std::for_each(par_unseq, begin, end, fn);
+    //
+    // par_unseq = parallel AND vectorised (SIMD). The runtime (TBB on Linux,
+    // ConcRT on Windows) decides how many threads to use based on core count.
+    //
+    std::for_each(PAR_POLICY
+        m_particles.begin(), m_particles.end(),
+        [&](Particle& p) {
+            if (!p.isAlive()) return;
 
-        // ── Step 1: Gravity ───────────────────────────────────────────────────
-        p.acceleration += gravityAccel;
+            // Step 1 — Gravity
+            p.acceleration += gravityAccel;
 
-        // ── Step 2: Mouse Attraction ──────────────────────────────────────────
-        if (m_attractorActive) {
-            const sf::Vector2f delta = m_attractorPos - p.position;
+            // Step 2 — Mouse Attraction
+            if (attracting) {
+                const sf::Vector2f delta    = attractorPos - p.position;
+                const float        dist     = std::sqrt(delta.x*delta.x + delta.y*delta.y);
+                const float        safeDist = std::max(dist, kAttractionMinDist);
+                p.acceleration += (delta / safeDist) * (kAttractionStrength / safeDist);
+            }
 
-            // Length of delta (Euclidean distance):
-            //   dist = √(dx² + dy²)
-            const float dist = std::sqrt(delta.x * delta.x + delta.y * delta.y);
+            // Step 3 — Semi-Implicit Euler (lives in Particle::update)
+            const bool wasAlive = p.isAlive();
+            p.update(dt);
+            // If this step killed the particle, decrement the live counter.
+            // fetch_sub with relaxed ordering is sufficient: the counter is only
+            // read for display, never used as a synchronisation point.
+            if (wasAlive && !p.isAlive())
+                m_activeCount.fetch_sub(1, std::memory_order_relaxed);
 
-            // Clamp to avoid division by zero at the cursor hotspot.
-            const float safeDist = std::max(dist, kAttractionMinDist);
+            // Step 4 — Boundary
+            switch (boundaryMode) {
+            case BoundaryMode::Wrap:
+                if      (p.position.x < 0.f)    p.position.x += boundsW;
+                else if (p.position.x > boundsW) p.position.x -= boundsW;
+                if      (p.position.y < 0.f)    p.position.y += boundsH;
+                else if (p.position.y > boundsH) p.position.y -= boundsH;
+                break;
+            case BoundaryMode::Bounce:
+                if (p.position.x < 0.f) {
+                    p.position.x = -p.position.x;
+                    p.velocity.x =  std::abs(p.velocity.x) * kRestitution;
+                } else if (p.position.x > boundsW) {
+                    p.position.x = 2.f * boundsW - p.position.x;
+                    p.velocity.x = -std::abs(p.velocity.x) * kRestitution;
+                }
+                if (p.position.y < 0.f) {
+                    p.position.y = -p.position.y;
+                    p.velocity.y =  std::abs(p.velocity.y) * kRestitution;
+                } else if (p.position.y > boundsH) {
+                    p.position.y = 2.f * boundsH - p.position.y;
+                    p.velocity.y = -std::abs(p.velocity.y) * kRestitution;
+                }
+                break;
+            case BoundaryMode::None: default: break;
+            }
 
-            // Normalise: divide each component by the length.
-            //   dir = delta / dist  →  ||dir|| == 1
-            const sf::Vector2f dir = delta / safeDist;
-
-            // Scale: stronger close up (1/r falloff), bounded by kAttractionMinDist.
-            const float strength = kAttractionStrength / safeDist;
-
-            p.acceleration += dir * strength;
+            // Step 5 — Visual decay
+            const float r = std::max(0.f, p.lifeRatio());
+            p.size = 4.f * r;
+            const auto u8 = [](float v) noexcept -> sf::Uint8 {
+                return static_cast<sf::Uint8>(v * 255.f);
+            };
+            p.color.r = 255;
+            p.color.g = u8(std::min(1.f, r * 2.f));
+            p.color.b = u8(r > 0.5f ? (r - 0.5f) * 2.f : 0.f);
+            p.color.a = u8(r);
         }
-
-        // ── Step 3: Semi-Implicit Euler ───────────────────────────────────────
-        p.update(dt);
-
-        // ── Step 4: Boundary ──────────────────────────────────────────────────
-        applyBoundary(p);
-
-        // ── Step 5: Visual decay ──────────────────────────────────────────────
-        const float r = std::max(0.f, p.lifeRatio());
-        p.size = 4.f * r;
-
-        const auto u8 = [](float v) noexcept -> sf::Uint8 {
-            return static_cast<sf::Uint8>(v * 255.f);
-        };
-        p.color.r = 255;
-        p.color.g = u8(std::min(1.f, r * 2.f));
-        p.color.b = u8(r > 0.5f ? (r - 0.5f) * 2.f : 0.f);
-        p.color.a = u8(r);
-    }
+    );
 
     rebuildVertices();
 }
 
-std::size_t ParticleSystem::activeCount() const noexcept {
-    std::size_t n = 0;
-    for (const auto& p : m_particles)
-        n += static_cast<std::size_t>(p.isAlive());
-    return n;
-}
-
-std::size_t ParticleSystem::maxCapacity() const noexcept { return m_maxParticles; }
-
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 void ParticleSystem::resetParticle(Particle& p) {
+    const bool wasDead = !p.isAlive();   // guard: only count net new lives
+
     const float angle = m_angleDist(m_rng) + m_angleBias(m_rng);
     const float speed = m_speedDist(m_rng);
-
     p.position     = m_emitter;
     p.velocity     = { std::cos(angle) * speed,
                        std::sin(angle) * speed - kUpwardBias };
@@ -176,101 +204,69 @@ void ParticleSystem::resetParticle(Particle& p) {
     p.maxLifetime  = p.lifetime;
     p.size         = 4.f;
     p.color        = sf::Color::White;
+
+    if (wasDead)
+        m_activeCount.fetch_add(1, std::memory_order_relaxed);
 }
 
-// ── Boundary: Wrap vs Bounce ──────────────────────────────────────────────────
+// ── Layer 3: Batch rendering ──────────────────────────────────────────────────
 //
-//  WRAP (toroidal):
-//    The screen is treated like a torus — leaving the right edge re-enters
-//    from the left. No velocity change: particles keep their momentum.
+// WHY sf::VertexArray BEATS sf::CircleShape:
 //
-//    Implementation: simple modular arithmetic.
-//      x < 0     →  x += W
-//      x > W     →  x -= W
+//   sf::CircleShape approach (naive):
+//     for each particle:
+//       shape.setPosition(p.position);   // update shape state
+//       shape.setFillColor(p.color);
+//       window.draw(shape);              // 1 GPU draw call per particle
+//                                        // = N state changes per frame
+//     At N=1 000 that's 1 000 draw calls. The GPU driver overhead alone
+//     stalls the CPU for milliseconds — frame rate collapses.
 //
-//    Edge case: a particle moving very fast could jump past the entire screen
-//    in one frame (tunnelling). For a visual sim this is acceptable, but in a
-//    physics sim you would loop until x ∈ [0, W].
+//   VertexArray approach (this code):
+//     Build all vertices into one contiguous buffer (rebuildVertices).
+//     Call draw() ONCE — one GPU upload, one draw call, zero state changes.
 //
-//  BOUNCE (reflection):
-//    The screen is a closed box. When a particle exits, we:
-//      1. Reflect its position back inside (prevents sticking to walls).
-//      2. Flip the relevant velocity component (reflection).
-//      3. Multiply by kRestitution < 1 (energy loss per impact).
+//   rebuildVertices() is also parallelised. Each particle i writes to
+//   slots [i*4, i*4+4) — no two particles share a slot, so no data race.
 //
-//    Position reflection for left wall:
-//      before:  x = -3         (3 px outside)
-//      after:   x = 3          (3 px inside)  →  x = -x  (while x < 0)
-//
-//    Position reflection for right wall (W = 1280):
-//      before:  x = 1283       (3 px outside)
-//      after:   x = 1277       →  x = 2*W - x
-//
-//    Velocity reflection:
-//      vx = -vx * kRestitution
-//      If restitution = 1.0: perfectly elastic (energy conserved).
-//      If restitution = 0.0: perfectly inelastic (stops dead at wall).
-//      We use 0.65: particles lose ~35% energy per bounce — feels natural.
-//
-void ParticleSystem::applyBoundary(Particle& p) const noexcept {
-    switch (m_boundaryMode) {
-
-    case BoundaryMode::Wrap:
-        if (p.position.x < 0.f)        p.position.x += m_boundsW;
-        else if (p.position.x > m_boundsW) p.position.x -= m_boundsW;
-        if (p.position.y < 0.f)        p.position.y += m_boundsH;
-        else if (p.position.y > m_boundsH) p.position.y -= m_boundsH;
-        break;
-
-    case BoundaryMode::Bounce:
-        // Left wall
-        if (p.position.x < 0.f) {
-            p.position.x  = -p.position.x;
-            p.velocity.x  = std::abs(p.velocity.x) * kRestitution;
-        }
-        // Right wall
-        else if (p.position.x > m_boundsW) {
-            p.position.x  = 2.f * m_boundsW - p.position.x;
-            p.velocity.x  = -std::abs(p.velocity.x) * kRestitution;
-        }
-        // Top wall
-        if (p.position.y < 0.f) {
-            p.position.y  = -p.position.y;
-            p.velocity.y  = std::abs(p.velocity.y) * kRestitution;
-        }
-        // Bottom wall
-        else if (p.position.y > m_boundsH) {
-            p.position.y  = 2.f * m_boundsH - p.position.y;
-            p.velocity.y  = -std::abs(p.velocity.y) * kRestitution;
-        }
-        break;
-
-    case BoundaryMode::None:
-    default:
-        break;
-    }
-}
-
 void ParticleSystem::rebuildVertices() {
-    m_vertices.resize(m_particles.size() * 4);
+    // Buffer was pre-sized to maxParticles*4 in the constructor.
+    // We never call resize() here — that is the entire point of pre-sizing.
+    const std::size_t n = m_particles.size();
 
-    for (std::size_t i = 0; i < m_particles.size(); ++i) {
-        const Particle& p  = m_particles[i];
-        const float     hs = p.size;
-        const sf::Color c  = p.isAlive() ? p.color : sf::Color::Transparent;
+    // ── Layer 2 (again): Parallel vertex build ────────────────────────────────
+    // We need an index (i) to address m_vertices[i*4 .. i*4+3].
+    // std::for_each iterates over particle VALUES, not indices. The trick:
+    // compute i from the particle's address relative to the vector's base.
+    // Pointer arithmetic on a contiguous std::vector is well-defined and fast.
+    const Particle* base = m_particles.data();
 
-        m_vertices[i * 4 + 0].position = { p.position.x - hs, p.position.y - hs };
-        m_vertices[i * 4 + 1].position = { p.position.x + hs, p.position.y - hs };
-        m_vertices[i * 4 + 2].position = { p.position.x + hs, p.position.y + hs };
-        m_vertices[i * 4 + 3].position = { p.position.x - hs, p.position.y + hs };
+    std::for_each(PAR_POLICY
+        m_particles.begin(), m_particles.begin() + static_cast<std::ptrdiff_t>(n),
+        [this, base](const Particle& p) {
+            const std::size_t i  = static_cast<std::size_t>(&p - base);
+            const float       hs = p.size;
+            const sf::Color   c  = p.isAlive() ? p.color : sf::Color::Transparent;
 
-        m_vertices[i * 4 + 0].color =
-        m_vertices[i * 4 + 1].color =
-        m_vertices[i * 4 + 2].color =
-        m_vertices[i * 4 + 3].color = c;
-    }
+            m_vertices[i*4+0] = {{ p.position.x - hs, p.position.y - hs }, c };
+            m_vertices[i*4+1] = {{ p.position.x + hs, p.position.y - hs }, c };
+            m_vertices[i*4+2] = {{ p.position.x + hs, p.position.y + hs }, c };
+            m_vertices[i*4+3] = {{ p.position.x - hs, p.position.y + hs }, c };
+        }
+    );
 }
 
 void ParticleSystem::draw(sf::RenderTarget& target, sf::RenderStates states) const {
-    target.draw(m_vertices, states);
+    if (m_particles.empty()) return;
+
+    // Raw sf::Vertex* overload: bypasses sf::VertexArray entirely.
+    // Arguments: pointer to first vertex, count of vertices to draw, primitive
+    // type, render states (transform, shader, texture — all default here).
+    //
+    // We draw exactly m_particles.size()*4 vertices — only the allocated slots.
+    // Dead-particle quads are transparent; the GPU discards them at rasterisation.
+    target.draw(m_vertices.data(),
+                m_particles.size() * 4,
+                sf::Quads,
+                states);
 }

@@ -5,36 +5,21 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ── Step 1: Download SFML with FetchContent ────────────────────────────────────
-# FetchContent pulls a library from a remote git repo and builds it from source
-# as part of *your* build. No system install required.
-#
-# Why this beats find_package() for cross-platform work:
-#   • find_package() relies on the library already being installed on the host.
-#     This fails on fresh CI runners and on any machine where SFML isn't in a
-#     standard system path.
-#   • FetchContent pins an exact version (GIT_TAG) so every developer and every
-#     CI runner builds against the same SFML revision — no "works on my machine"
-#     version skew.
-#   • Works identically on Linux, macOS, and Windows with no extra steps.
-#
 include(FetchContent)
 
 FetchContent_Declare(
     SFML
     GIT_REPOSITORY https://github.com/SFML/SFML.git
-    GIT_TAG        2.6.1        # pinned release — change to upgrade
-    GIT_SHALLOW    TRUE         # only clone the tagged commit, not full history
+    GIT_TAG        2.6.1
+    GIT_SHALLOW    TRUE
 )
 
-# ── Step 2: Disable SFML modules we don't need ────────────────────────────────
-# This cuts compile time significantly — sfml-audio alone pulls in OpenAL and
-# several codec libraries. We only need graphics + window + system.
 set(SFML_BUILD_AUDIO   OFF CACHE BOOL "" FORCE)
 set(SFML_BUILD_NETWORK OFF CACHE BOOL "" FORCE)
 
 FetchContent_MakeAvailable(SFML)
 
-# ── Step 3: Define the executable ─────────────────────────────────────────────
+# ── Step 2: Executable ────────────────────────────────────────────────────────
 add_executable(particle_sim
     src/main.cpp
     src/ParticleSystem.cpp
@@ -42,31 +27,62 @@ add_executable(particle_sim
 
 target_include_directories(particle_sim PRIVATE include)
 
-# ── Step 4: Link SFML ─────────────────────────────────────────────────────────
-# SFML 2.x targets use lowercase names when built from source via FetchContent.
-# (SFML 3.x switches to SFML::Graphics style — update GIT_TAG and these names
-#  together if you upgrade.)
-#
-# PRIVATE means SFML headers are an implementation detail of particle_sim and
-# won't leak into any downstream targets that link particle_sim.
 target_link_libraries(particle_sim PRIVATE
-    sfml-graphics   # sf::RenderWindow, sf::VertexArray, sf::Color …
-    sfml-window     # sf::Window, sf::Event, sf::Mouse …
-    sfml-system     # sf::Vector2f, sf::Clock, sf::Time …
+    sfml-graphics
+    sfml-window
+    sfml-system
 )
 
-# ── Step 5: Compiler warnings and optimisation ────────────────────────────────
-# Use generator expressions to emit the right flags per compiler:
-#   GCC/Clang → -O2 -Wall -Wextra -Wpedantic
-#   MSVC      → /O2 /W4
+# ── Step 3: Optional TBB for std::execution::par_unseq ────────────────────────
+#
+# std::execution::par_unseq (C++17 Parallel STL) needs a backend scheduler:
+#
+#   Platform    Compiler   Backend       Action needed
+#   ─────────── ────────── ─────────── ──────────────────────────────────────
+#   Linux       GCC/Clang  Intel TBB   find_package(TBB) + link TBB::tbb
+#   macOS       AppleClang none        NOT supported → sequential fallback
+#   Windows     MSVC       ConcRT      built into CRT, no extra library
+#
+# We define PARTICLE_PARALLEL only when the backend is available, so
+# ParticleSystem.cpp selects the right execution policy at compile time:
+#
+#   #ifdef PARTICLE_PARALLEL
+#     std::for_each(std::execution::par_unseq, ...)   // multi-core
+#   #else
+#     std::for_each(                           ...)   // single-core fallback
+#   #endif
+#
+if(MSVC)
+    # MSVC ships its own parallel STL — no extra library.
+    target_compile_definitions(particle_sim PRIVATE PARTICLE_PARALLEL)
+    message(STATUS "[particle_sim] Parallel updates: ENABLED (MSVC/ConcRT)")
+
+elseif(NOT APPLE)
+    # GCC and Clang on Linux need TBB.
+    # Install on Ubuntu/Debian: sudo apt-get install libtbb-dev
+    # Install on Fedora/RHEL:   sudo dnf install tbb-devel
+    find_package(TBB QUIET)
+
+    if(TBB_FOUND)
+        target_link_libraries(particle_sim PRIVATE TBB::tbb)
+        target_compile_definitions(particle_sim PRIVATE PARTICLE_PARALLEL)
+        message(STATUS "[particle_sim] Parallel updates: ENABLED (TBB ${TBB_VERSION})")
+    else()
+        message(STATUS "[particle_sim] Parallel updates: DISABLED (TBB not found — install libtbb-dev)")
+    endif()
+
+else()
+    # AppleClang does not implement <execution> — sequential fallback.
+    message(STATUS "[particle_sim] Parallel updates: DISABLED (AppleClang has no <execution>)")
+endif()
+
+# ── Step 4: Compiler warnings and optimisation ────────────────────────────────
 target_compile_options(particle_sim PRIVATE
     $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O2 -Wall -Wextra -Wpedantic>
     $<$<CXX_COMPILER_ID:MSVC>:/O2 /W4>
 )
 
-# ── Step 6: Copy SFML DLLs next to the exe on Windows (runtime requirement) ───
-# On Windows, SFML is built as DLLs. Without this, the exe won't run because
-# Windows searches for DLLs in the same directory as the binary first.
+# ── Step 5: Copy SFML DLLs on Windows ────────────────────────────────────────
 if(WIN32)
     add_custom_command(TARGET particle_sim POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
