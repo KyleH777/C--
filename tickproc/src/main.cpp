@@ -1,12 +1,14 @@
 #include "mapped_file.h"
 #include "pipeline.h"
 
-#include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <mutex>
+#include <string>
 #include <string_view>
+#include <unordered_map>
 
 static void usage(const char* prog) {
     std::cerr << "Usage: " << prog << " <csv-file> [--no-header]\n"
@@ -45,43 +47,35 @@ int main(int argc, char* argv[]) {
         cfg.skip_header = skip_header;
         Pipeline pipeline(cfg);
 
-        // ── Consumer: example aggregation (VWAP per symbol) ────────────
+        // ── Consumer: mutex-protected VWAP aggregation per symbol ──────
         struct SymbolAgg {
-            double   turnover = 0.0;  // Σ(price × volume)
+            double   turnover  = 0.0;
             uint64_t total_vol = 0;
         };
 
-        // Per-thread local maps to avoid lock contention
-        thread_local std::unordered_map<std::string, SymbolAgg> local_aggs;
-
-        std::mutex merge_mu;
-        std::unordered_map<std::string, SymbolAgg> global_aggs;
+        std::mutex agg_mu;
+        std::unordered_map<std::string, SymbolAgg> aggs;
 
         auto stats = pipeline.run(file, [&](TickRow&& row) {
-            auto& agg = local_aggs[row.symbol];
+            std::lock_guard<std::mutex> lock(agg_mu);
+            auto& agg = aggs[row.symbol];
             agg.turnover  += row.price * static_cast<double>(row.volume);
             agg.total_vol += row.volume;
         });
-
-        // Merge thread-local maps — this runs after pipeline.run() returns,
-        // so no lock contention during hot path.
-        // Note: thread_local maps from jthreads are already destroyed,
-        // so for a real app you'd capture per-thread maps explicitly.
-        // Here we demonstrate the pattern; production code should use
-        // per-thread accumulators passed via the consumer closure.
 
         auto t1 = std::chrono::high_resolution_clock::now();
         double elapsed = std::chrono::duration<double>(t1 - t0).count();
 
         // ── Report ─────────────────────────────────────────────────────
-        std::cerr << "Parsed:   " << stats.rows_parsed   << " rows\n"
-                  << "Consumed: " << stats.rows_consumed << " rows\n"
-                  << "Elapsed:  " << elapsed << " s\n"
+        std::cerr << "Symbols:  " << aggs.size()          << "\n"
+                  << "Parsed:   " << stats.rows_parsed    << " rows\n"
+                  << "Consumed: " << stats.rows_consumed  << " rows\n"
+                  << "Elapsed:  " << elapsed              << " s\n"
                   << "Throughput: "
                   << (file.size() / (1024.0 * 1024.0)) / elapsed
                   << " MiB/s\n";
 
-    } catch (const std::system_error& e) {
+    } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
         return EXIT_FAILURE;
     }
