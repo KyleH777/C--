@@ -1,7 +1,7 @@
 #include "csv_parser.h"
-#include <fast_float/fast_float.h>
 #include <algorithm>
 #include <charconv>
+#include <cstdlib>
 #include <cstring>
 
 std::string_view CsvParser::next_field(
@@ -27,11 +27,15 @@ TickRowView CsvParser::parse_line(std::string_view line) {
     // symbol — zero-copy view
     row.symbol = next_field(p, end);
 
-    // price — parsed with fast_float (4–10× faster than strtod)
+    // price — parsed with strtod via a small stack buffer
     auto price_sv = next_field(p, end);
-    fast_float::from_chars(price_sv.data(),
-                           price_sv.data() + price_sv.size(),
-                           row.price);
+    {
+        char buf[64];
+        auto len = std::min(price_sv.size(), sizeof(buf) - 1);
+        std::memcpy(buf, price_sv.data(), len);
+        buf[len] = '\0';
+        row.price = std::strtod(buf, nullptr);
+    }
 
     // volume — parsed with std::from_chars (zero-alloc integer parse)
     auto vol_sv = next_field(p, end);

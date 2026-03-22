@@ -31,23 +31,12 @@ else()
     endif()
 endif()
 
-# ── fast_float (header-only, fetched at configure time) ─────────────────────
-include(FetchContent)
-FetchContent_Declare(
-    fast_float
-    GIT_REPOSITORY https://github.com/fastfloat/fast_float.git
-    GIT_TAG        v8.0.2
-)
-FetchContent_MakeAvailable(fast_float)
-
 # ── Library target (core logic, reusable in tests) ──────────────────────────
 add_library(tickproc_core STATIC
     src/mapped_file.cpp
     src/csv_parser.cpp
 )
 target_include_directories(tickproc_core PUBLIC include)
-target_link_libraries(tickproc_core PUBLIC FastFloat::fast_float)
-
 # Platform-specific link dependencies
 if(UNIX)
     target_link_libraries(tickproc_core PUBLIC pthread)
