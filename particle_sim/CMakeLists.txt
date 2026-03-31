@@ -79,7 +79,7 @@ endif()
 # ── Step 4: Compiler warnings and optimisation ────────────────────────────────
 target_compile_options(particle_sim PRIVATE
     $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O2 -Wall -Wextra -Wpedantic>
-    $<$<CXX_COMPILER_ID:MSVC>:/O2 /W4>
+    $<$<CXX_COMPILER_ID:MSVC>:$<IF:$<CONFIG:Debug>,/Od,/O2> /W4>
 )
 
 # ── Step 5: Copy SFML DLLs on Windows ────────────────────────────────────────
